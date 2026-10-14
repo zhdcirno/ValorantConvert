@@ -1,0 +1,422 @@
+--- a/auto_material_watcher.py
++++ b/auto_material_watcher.py
+@@ -7,6 +7,7 @@
+ #    start_overview() / stop_overview() / toggle_overview() / is_overview_running()
+ #    run_once() / run_overview_once()
+ #    suppress(seconds) / suppress_overview(seconds)
++#    get_active_skin() — 最近导入的皮肤名（供 create_overview.resolve_skin）
+ #
+ #  目录约定：本文件、batch_material_setup.py、create_overview.py 同目录
+ # =========================================================
+@@ -25,6 +26,14 @@
+     "/Game/Charm/",
+ ]
+ 
++# 预览地图只关心 Gun 下的新皮肤目录（Charm 不驱动 overview）
++GUN_WATCH_PATH = "/Game/Gun/"   # ★ 尾斜杠必须保留：_snapshot_subdirs 的
++                                #   pkg[len(path):] 切分依赖它
++
++# 非皮肤目录黑名单（产物目录）。watcher 与 create_overview 共用此约定；
++# create_overview 侧 import 失败时自带同名兜底
++SKIN_DIR_BLACKLIST = ("map",)
++
+ DEBOUNCE_SECONDS = 3.0
+ COOLDOWN_SECONDS = 3.0
+ AUTO_RUN = True
+@@ -65,6 +74,9 @@
+         "overview_countdown": 0.0,
+         "overview_executing": False,
+         "overview_cooldown": 0.0,
++        # ── 皮肤目录检测（供 create_overview.resolve_skin 使用）──
++        "subdir_snapshot": {},       # {"/Game/Gun/": set(子目录名), ...}
++        "last_changed_skin": None,   # 最近一次"新增子目录"的名字（仅 Gun 路径）
+     }
+ 
+ _state = sys.modules[_GLOBAL_KEY]
+@@ -79,6 +91,8 @@
+     ("overview_countdown", 0.0),
+     ("overview_executing", False),
+     ("overview_cooldown", 0.0),
++    ("subdir_snapshot", {}),
++    ("last_changed_skin", None),
+ ):
+     if k not in _state:
+         _state[k] = v
+@@ -189,6 +203,130 @@
+ 
+ 
+ # ─────────────────────────────────────────────
++# 皮肤目录检测（P0-1 · 供 create_overview.resolve_skin 使用）
++# ─────────────────────────────────────────────
++
++def _disk_subdirs(path):
++    """os.listdir 枚举 {Content}/ 下对应目录的一级子目录；失败返回 None"""
++    try:
++        leaf = path.strip("/").split("/")[-1]  # "Gun" / "Charm"
++        content_dir = unreal.Paths.convert_relative_path_to_full(
++            unreal.Paths.project_content_dir()
++        )
++        root = os.path.join(content_dir, leaf)
++        if os.path.isdir(root):
++            return {n for n in os.listdir(root)
++                    if os.path.isdir(os.path.join(root, n))}
++    except Exception:
++        pass
++    return None
++
++
++def _snapshot_subdirs():
++    """各监听路径的一级子目录名集合快照
++
++    枚举方式（军师意见③）：os.listdir 优先（快，start() 基线采样无感），
++    失败时回退 AssetRegistry（与编辑器视图一致，但全扫较贵）。
++    """
++    registry = None
++    result = {}
++    for path in WATCH_PATHS:
++        names = _disk_subdirs(path)
++        if names is None:
++            names = set()
++            try:
++                if registry is None:
++                    registry = unreal.AssetRegistryHelpers.get_asset_registry()
++                assets = registry.get_assets_by_path(path, recursive=True)
++                for a in assets:
++                    try:
++                        pkg = str(a.package_name)  # 如 /Game/Gun/InnerRage/Mesh/xxx
++                    except Exception:
++                        continue
++                    if pkg.startswith(path):
++                        top = pkg[len(path):].split("/", 1)[0]
++                        if top:
++                            names.add(top)
++            except Exception:
++                pass
++        result[path] = names
++    return result
++
++
++def _pick_newest_dir(names):
++    """多个新增目录时取谁（军师意见①，规则写死）：
++    磁盘 mtime 最新优先；mtime 相同则字典序取末位。"""
++    try:
++        content_dir = unreal.Paths.convert_relative_path_to_full(
++            unreal.Paths.project_content_dir()
++        )
++        gun_root = os.path.join(content_dir, "Gun")
++    except Exception:
++        gun_root = None
++    best_name, best_key = None, (-1.0, "")
++    for n in names:
++        m = -1.0
++        if gun_root:
++            try:
++                m = os.path.getmtime(os.path.join(gun_root, n))
++            except OSError:
++                m = -1.0
++        key = (m, n)
++        if key > best_key:
++            best_key, best_name = key, n
++    return best_name
++
++
++def _detect_new_skin_dirs():
++    """对比上次子目录名集合快照，把 Gun 下新增的子目录记为 last_changed_skin
++
++    ★ 只关心"新目录出现"，不关心已有目录内资产数涨跌——
++      避免 batch_material_setup 建 MI_ 触发自己（军师审阅意见 A）。
++    ★ 只在顶层总数变化时被调用（军师审阅意见 B），常驻开销与现状一致。
++    ★ last_changed_skin 存纯名（如 "InnerRage"，不含路径），
++      create_overview 侧直接 f"{GUN_ROOT}/{skin}" 拼路径（军师意见⑤）。
++    """
++    try:
++        snap = _snapshot_subdirs()
++    except Exception as e:
++        log_warn(f"子目录快照失败: {e}")
++        return
++
++    old = _state.get("subdir_snapshot") or {}
++    newest = None  # ★ 显式初始化：Gun 无新增而 Charm 有新增时不得残留旧值
++
++    for path, names in snap.items():
++        prev = old.get(path) or set()
++        added = names - prev
++        # 黑名单目录（如顶层 Map/）永远不算新皮肤
++        added = {n for n in added if n.lower() not in SKIN_DIR_BLACKLIST}
++        if not added:
++            continue
++        # ★ 有意只认 Gun 路径的新增目录（军师意见②定性：设计，非遗漏）——
++        #   Charm 的新目录语义是"新挂饰"，预览地图不消费它；
++        #   未来做挂饰预览地图时在此处一并扩展。
++        if path == GUN_WATCH_PATH:
++            newest = _pick_newest_dir(added)
++
++    _state["subdir_snapshot"] = snap
++    if newest:
++        _state["last_changed_skin"] = newest
++        log(f"检测到新皮肤目录: {newest}")
++
++
++def get_active_skin():
++    """对外接口：返回最近导入的皮肤纯名（如 "InnerRage"），无效时返回 None
++
++    ★ 返回皮肤名字符串或 None，不是 bool（军师意见④）；调用方判 `if skin:`。
++    有效性：本 UE 会话内至少完成过一次子目录快照（快照非空），
++    避免读到无基线的残留值（军师审阅意见 C）。
++    """
++    if _state.get("subdir_snapshot"):
++        return _state.get("last_changed_skin")
++    return None
++
++
++# ─────────────────────────────────────────────
+ # Tick 注册 / 注销
+ # ─────────────────────────────────────────────
+ 
+@@ -219,7 +357,7 @@
+ # 执行材质脚本
+ # ─────────────────────────────────────────────
+ 
+-def _run_material_script():
++def _run_material_script(trigger_overview=True):
+     log("触发自动材质脚本")
+     _state["executing"] = True
+     try:
+@@ -244,8 +382,9 @@
+         _state["executing"] = False
+         _state["cooldown"] = COOLDOWN_SECONDS
+ 
+-        # ★ 材质处理完成 → 若自动预览地图开启，启动 overview 倒计时
+-        if _state.get("overview_running"):
++        # ★ 只有自动触发才联动 overview（手动 run_once 不触发，解耦决策）
++        #   且必须自动预览地图监听本身已开启（overview_running）才倒计时
++        if trigger_overview and _state.get("overview_running"):
+             _state["overview_pending"] = True
+             _state["overview_countdown"] = OVERVIEW_DEBOUNCE_SECONDS
+             log(f"材质处理完成 → {OVERVIEW_DEBOUNCE_SECONDS:.0f}s 后创建预览地图")
+@@ -304,10 +443,12 @@
+         elif not _state.get("executing"):
+             if _state.get("last_count") is None:
+                 _state["last_count"] = _count_assets()
++                _state["subdir_snapshot"] = _snapshot_subdirs()  # 建立子目录基线
+                 log(f"初始资产数: {_state['last_count']}  {_count_per_path()}")
+             else:
+                 current = _count_assets()
+                 if current != _state["last_count"]:
++                    _detect_new_skin_dirs()  # 顶层总数变了才做一次子目录对比
+                     diff = current - _state["last_count"]
+                     log(f"资产数变化: {_state['last_count']} → {current} ({diff:+d})  {_count_per_path()}")
+                     _state["last_count"] = current
+@@ -352,6 +493,10 @@
+     _state["countdown"] = 0.0
+     _state["executing"] = False
+     _state["cooldown"] = 0.0
++    # ★ 重置皮肤检测状态：切换 Blender 工程后，旧会话的 last_changed_skin
++    #   不能带进新一轮监听（否则可能指向旧工程的皮肤）
++    _state["subdir_snapshot"] = {}
++    _state["last_changed_skin"] = None
+     if not _ensure_tick_registered():
+         _state["running"] = False
+         return False
+@@ -451,13 +596,17 @@
+ # ─────────────────────────────────────────────
+ 
+ def run_once():
+-    """手动执行一次材质脚本（不启动监听）"""
++    """手动执行一次材质脚本（不启动监听、不触发预览地图）
++
++    ★ 解耦决策：手动材质与预览地图完全独立，跑完材质不联动 overview 倒计时；
++      如需刷新预览地图，单独点「手动预览地图-处理」(import create_overview as c; c.run())。
++    """
+     log("手动执行材质脚本")
+     _ensure_script_path()
+     if not _state.get("material_script"):
+         log_warn(f"未找到 {TARGET_SCRIPT_NAME}")
+         return False
+-    _run_material_script()
++    _run_material_script(trigger_overview=False)   # ★ 手动：不联动
+     return True
+ 
+ 
+--- a/create_overview.py
++++ b/create_overview.py
+@@ -9,6 +9,7 @@
+ # =========================================================
+ 
+ import unreal
++import os
+ import re
+ 
+ 
+@@ -16,9 +17,22 @@
+ # 配置
+ # ─────────────────────────────────────────────
+ 
+-SKIN_NAME = "InnerRage"
++# ★ 皮肤名解析（P0-1，三级 fallback，详见交接文档）：
++#   1. SKIN_OVERRIDE / SKIN_NAME 非空 → 强制指定（后门）
++#   2. watcher.get_active_skin()      → 最近导入的皮肤（自动路径）
++#   3. 磁盘 mtime 扫描 {Content}/Gun/ → 兜底（手动按钮直调时）
++#   都失败 → log_err 退出
++SKIN_NAME = ""            # 后门：非空时强制指定
++SKIN_OVERRIDE = None      # EUW 手动传参通道：c.SKIN_OVERRIDE="XXX"; c.run()
+ GUN_ROOT = "/Game/Gun"
+ 
++# mtime 扫描的黑名单子目录（军师意见⑧）：Map/ 只含我们生成的 L_{skin}_Overview，
++# 不算皮肤信号。常量以 watcher 侧为准（双端统一），import 失败时用同名兜底
++try:
++    from auto_material_watcher import SKIN_DIR_BLACKLIST as _SKIN_DIR_BLACKLIST
++except Exception:
++    _SKIN_DIR_BLACKLIST = ("map",)
++
+ TEMPLATE_MAP = "/Engine/Maps/Templates/Template_Default"
+ 
+ GUN_TYPES = ["BasePistol", "AutoShotgun", "Melee", "Burst", "Carbine"]
+@@ -98,11 +112,106 @@
+ 
+ 
+ # ─────────────────────────────────────────────
++# 皮肤名解析（P0-1）
++# ─────────────────────────────────────────────
++# 皮肤名以局部变量+参数传递（军师意见⑥）：main() 每次执行都重新解析，
++# 同一会话连续两次 run() 不会读到旧皮肤；不用模块级跨调用缓存。
++
++
++def _latest_skin_dir_on_disk():
++    """扫 {Content}/Gun/*/ 取最近改动的候选皮肤目录
++
++    候选判定（军师意见⑧ + Q8 修正，白名单为主）：
++      - registry 查到资产：必须含 SkeletalMesh 才算候选；
++      - registry 查询为空（未扫完/无资产）：★ 保守排除，宁可漏判不误判
++        （军师 Q8：漏判无损失——registry 就绪后总数变化会再触发；
++        误判会写入脏皮肤名，用户还得手动清）；
++      - 黑名单目录（Map/ 等产物目录）任何分支下都排除。
++    """
++    try:
++        content_dir = unreal.Paths.convert_relative_path_to_full(
++            unreal.Paths.project_content_dir()
++        )
++        gun_root = os.path.join(content_dir, "Gun")
++        if not os.path.isdir(gun_root):
++            return None
++
++        registry = None
++        best_name, best_mtime = None, -1.0
++        for name in os.listdir(gun_root):
++            d = os.path.join(gun_root, name)
++            if not os.path.isdir(d):
++                continue
++            if name.lower() in _SKIN_DIR_BLACKLIST:
++                continue
++
++            # 白名单：确认含 SkeletalMesh 才算候选；查询为空 → 保守排除（Q8）
++            try:
++                if registry is None:
++                    registry = unreal.AssetRegistryHelpers.get_asset_registry()
++                assets = registry.get_assets_by_path(
++                    f"{GUN_ROOT}/{name}", recursive=True
++                )
++                if not any(
++                    str(a.asset_class_path.asset_name) == "SkeletalMesh"
++                    for a in assets
++                ):
++                    continue  # 无资产（未扫完）或有资产但无骨架网格 → 都排除
++            except Exception:
++                continue  # 查询异常 → 同样保守排除
++
++            latest = -1.0
++            for root, dirs, files in os.walk(d):
++                dirs[:] = [x for x in dirs if x.lower() not in _SKIN_DIR_BLACKLIST]
++                for f in files:
++                    if not f.lower().endswith(".uasset"):
++                        continue
++                    try:
++                        m = os.path.getmtime(os.path.join(root, f))
++                    except OSError:
++                        continue
++                    if m > latest:
++                        latest = m
++            if latest > best_mtime:
++                best_mtime, best_name = latest, name
++        return best_name
++    except Exception as e:
++        log_warn(f"mtime 扫描失败: {e}")
++        return None
++
++
++def resolve_skin():
++    """三级解析当前皮肤名（优先级见配置区注释，军师意见 C）"""
++    # 1) 显式覆盖
++    override = SKIN_OVERRIDE or SKIN_NAME
++    if override:
++        log(f"皮肤（显式指定）: {override}")
++        return override
++
++    # 2) watcher 记录的最近导入皮肤
++    try:
++        import auto_material_watcher as w
++        skin = w.get_active_skin()
++        if skin:
++            log(f"皮肤（watcher 记录）: {skin}")
++            return skin
++    except Exception:
++        pass
++
++    # 3) 磁盘 mtime 兜底
++    skin = _latest_skin_dir_on_disk()
++    if skin:
++        log(f"皮肤（mtime 兜底）: {skin}")
++        return skin
++
++    return ""
++
++
++# ─────────────────────────────────────────────
+ # 1. 创建 / 打开 Overview 关卡
+ # ─────────────────────────────────────────────
+ 
+-def create_overview_level():
+-    skin = SKIN_NAME
++def create_overview_level(skin):
+     map_dir = f"{GUN_ROOT}/{skin}/Map"
+     map_name = f"L_{skin}_Overview"
+     full_path = f"{map_dir}/{map_name}"
+@@ -198,8 +307,7 @@
+ # 4. 扫描资产
+ # ─────────────────────────────────────────────
+ 
+-def scan_assets():
+-    skin = SKIN_NAME
++def scan_assets(skin):
+     root = f"{GUN_ROOT}/{skin}"
+ 
+     registry = unreal.AssetRegistryHelpers.get_asset_registry()
+@@ -492,9 +600,18 @@
+     log("创建 Overview 预览场景 - 开始")
+     log("=" * 60)
+ 
++    # ★ 每次执行都重新解析（军师意见⑥：局部变量+参数传递，无跨调用缓存）
++    skin = resolve_skin()
++    if not skin:
++        log_err("未解析到皮肤名（显式指定 / watcher 记录 / mtime 扫描均失败）。")
++        log_err("可能原因：编辑器刚启动，AssetRegistry 尚未扫完（白名单宁可漏判不误判），请稍候重试。")
++        log_err("强制指定方法: import create_overview as c; c.SKIN_OVERRIDE='皮肤名'; c.run()")
++        return
++    log(f"目标皮肤: {skin}")
++
+     suppress_auto_material(180.0)
+ 
+-    map_path = create_overview_level()
++    map_path = create_overview_level(skin)
+     if not map_path:
+         log_err("关卡创建失败，终止")
+         return
+@@ -509,7 +626,7 @@
+ 
+     log("")
+     log("── 扫描资产 ──")
+-    guns, magazines, accessories = scan_assets()
++    guns, magazines, accessories = scan_assets(skin)
+     if not guns:
+         log_warn("未找到枪械主体，退出")
+         return

@@ -1,0 +1,43 @@
+--- a/auto_material_watcher.py (改前)
++++ b/auto_material_watcher.py (改后·解耦)
+@@ -357,7 +357,7 @@
+ # 执行材质脚本
+ # ─────────────────────────────────────────────
+ 
+-def _run_material_script():
++def _run_material_script(trigger_overview=True):
+     log("触发自动材质脚本")
+     _state["executing"] = True
+     try:
+@@ -382,8 +382,9 @@
+         _state["executing"] = False
+         _state["cooldown"] = COOLDOWN_SECONDS
+ 
+-        # ★ 材质处理完成 → 若自动预览地图开启，启动 overview 倒计时
+-        if _state.get("overview_running"):
++        # ★ 只有自动触发才联动 overview（手动 run_once 不触发，解耦决策）
++        #   且必须自动预览地图监听本身已开启（overview_running）才倒计时
++        if trigger_overview and _state.get("overview_running"):
+             _state["overview_pending"] = True
+             _state["overview_countdown"] = OVERVIEW_DEBOUNCE_SECONDS
+             log(f"材质处理完成 → {OVERVIEW_DEBOUNCE_SECONDS:.0f}s 后创建预览地图")
+@@ -595,13 +596,17 @@
+ # ─────────────────────────────────────────────
+ 
+ def run_once():
+-    """手动执行一次材质脚本（不启动监听）"""
++    """手动执行一次材质脚本（不启动监听、不触发预览地图）
++
++    ★ 解耦决策：手动材质与预览地图完全独立，跑完材质不联动 overview 倒计时；
++      如需刷新预览地图，单独点「手动预览地图-处理」(import create_overview as c; c.run())。
++    """
+     log("手动执行材质脚本")
+     _ensure_script_path()
+     if not _state.get("material_script"):
+         log_warn(f"未找到 {TARGET_SCRIPT_NAME}")
+         return False
+-    _run_material_script()
++    _run_material_script(trigger_overview=False)   # ★ 手动：不联动
+     return True
+ 
+ 

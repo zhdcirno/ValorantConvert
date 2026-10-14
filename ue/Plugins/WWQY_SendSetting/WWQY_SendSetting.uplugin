@@ -1,0 +1,20 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "WWQY_SendSetting",
+	"Description": "Valorant workflow",
+	"Category": "Pipeline",
+	"CreatedBy": "cirno",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"PostStartupScripts": [
+		"Plugins/WWQY_SendSetting/Content/Python/bootstrap.py"
+    ]
+}
