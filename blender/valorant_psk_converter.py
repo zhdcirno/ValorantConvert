@@ -351,6 +351,20 @@ def install_psk_via_extension_platform():
     return False, "扩展平台未找到 PSK 插件"
 
 
+# 离线兜底提示：网络下载失败时引导用户使用仓库内置 / 官方离线包手动安装
+_MANUAL_INSTALL_HINT_PSK = (
+    "【离线兜底】网络下载失败。可手动安装仓库内置包："
+    "blender/vendor/io_scene_psk_psa_v9.1.3.zip"
+    "（Blender 5.x → Edit → Preferences → Extensions → Install from Disk → 选该 zip）。"
+    "详细说明见 blender/vendor/README.md。"
+)
+_MANUAL_INSTALL_HINT_SEND2UE = (
+    "【离线兜底】网络下载失败。Send to Unreal 不随仓库分发，请从官方 Release 手动下载："
+    "https://github.com/poly-hammer/BlenderTools/releases （取 send2ue_2.6.7.zip），"
+    "Blender → Edit → Preferences → Add-ons → Install from Disk → 选 zip。详见 blender/vendor/README.md。"
+)
+
+
 def install_psk_from_github():
     temp_dir = None
     try:
@@ -372,7 +386,7 @@ def install_psk_from_github():
         zip_path = os.path.join(temp_dir, "psk_raw.zip")
         ok, msg = _http_download_file(zip_url, zip_path)
         if not ok:
-            return False, msg
+            return False, msg + "\n" + _MANUAL_INSTALL_HINT_PSK
         success, message = _install_addon_from_downloaded_zip(zip_path, PSK_ADDON_MODULE, temp_dir)
         if not success:
             return False, message
@@ -463,7 +477,7 @@ def install_send2ue_from_github():
         downloaded_zip = os.path.join(temp_dir, "download.zip")
         ok, msg = _http_download_file(zip_url, downloaded_zip)
         if not ok:
-            return False, msg
+            return False, msg + "\n" + _MANUAL_INSTALL_HINT_SEND2UE
         success, message = _install_addon_from_downloaded_zip(downloaded_zip, SEND2UE_ADDON_MODULE, temp_dir)
         if not success:
             return False, message
